@@ -148,27 +148,42 @@ jobs:
           echo "::add-mask::$MCP_LOGIN_TICKET_SECRET"
           echo "Generated secrets"
 
-      - name: Migrate D1 Remote (Robust)
+      - name: Migrate D1 Remote (Robust - Fix for fresh DB)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           cd cod-server
           export COD_DB_NAME=${{ env.PROJECT }}-db
-          echo "=== Attempt 1: wrangler d1 migrations apply ==="
+          echo "=== DB: $COD_DB_NAME ==="
+          
+          echo "=== Step 0: Create d1_migrations table manually (fixes SQLITE_ERROR 7500) ==="
+          npx wrangler d1 execute $COD_DB_NAME --remote --command "CREATE TABLE IF NOT EXISTS d1_migrations (id TEXT PRIMARY KEY, name TEXT, applied_at TEXT DEFAULT CURRENT_TIMESTAMP);" 2>&1 || true
+          
+          echo "=== Step 1: Check current tables ==="
+          npx wrangler d1 execute $COD_DB_NAME --remote --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;" 2>&1 || true
+          
+          echo "=== Step 2: Try wrangler migrations apply (may fail first time) ==="
+          npx wrangler d1 migrations apply $COD_DB_NAME --remote 2>&1 || echo "First migrations apply failed, continuing to manual method"
+          
+          echo "=== Step 3: Execute 0000_complete.sql directly via D1 ==="
+          # Split 0000_complete.sql by statement-breakpoint and execute in batches if needed
+          # Try direct file execution first
+          npx wrangler d1 execute $COD_DB_NAME --remote --file=src/db/migrations/0000_complete.sql 2>&1 | tail -n 100 || true
+          
+          echo "=== Step 4: Execute remaining migrations one by one via file ==="
+          for f in src/db/migrations/0001_*.sql src/db/migrations/0002_*.sql src/db/migrations/0003_*.sql src/db/migrations/0004_*.sql src/db/migrations/0005_*.sql src/db/migrations/0006_*.sql src/db/migrations/0007_*.sql src/db/migrations/0008_*.sql src/db/migrations/0009_*.sql src/db/migrations/0010_*.sql src/db/migrations/0011_*.sql src/db/migrations/0012_*.sql src/db/migrations/0013_*.sql src/db/migrations/0014_*.sql src/db/migrations/0015_*.sql src/db/migrations/0016_*.sql src/db/migrations/0017_*.sql src/db/migrations/0018_*.sql src/db/migrations/0019_*.sql src/db/migrations/0020_*.sql src/db/migrations/0021_*.sql src/db/migrations/0022_*.sql src/db/migrations/0023_*.sql src/db/migrations/0024_*.sql; do
+            if [ -f "$f" ]; then
+              echo "Applying $f..."
+              npx wrangler d1 execute $COD_DB_NAME --remote --file="$f" 2>&1 | tail -n 20 || echo "$f failed, continuing"
+            fi
+          done
+          
+          echo "=== Step 5: Final migrations apply to sync journal ==="
           npx wrangler d1 migrations apply $COD_DB_NAME --remote 2>&1 || true
           
-          echo "=== Check tables ==="
-          npx wrangler d1 execute $COD_DB_NAME --remote --command "SELECT name FROM sqlite_master WHERE type='table' LIMIT 20;" 2>&1 || true
-          
-          echo "=== Attempt 2: If d1_migrations missing, create it and apply 0000_complete.sql ==="
-          # Try to apply 0000_complete.sql directly if tables missing
-          npx wrangler d1 execute $COD_DB_NAME --remote --file=src/db/migrations/0000_complete.sql 2>&1 || echo "0000_complete.sql may have failed, trying alternative"
-          
-          echo "=== Attempt 3: Re-apply all migrations ==="
-          npx wrangler d1 migrations apply $COD_DB_NAME --remote 2>&1 || true
-          
-          echo "=== Final table check ==="
+          echo "=== Step 6: Final table check ==="
           npx wrangler d1 execute $COD_DB_NAME --remote --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;" 2>&1 | tail -n 100
+          npx wrangler d1 execute $COD_DB_NAME --remote --command "SELECT count(*) as migrations FROM d1_migrations;" 2>&1 | tail -n 20 || true
 
       - name: Seed D1 Remote
         env:
