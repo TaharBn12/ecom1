@@ -1,0 +1,392 @@
+name: Deploy CodFlow to Cloudflare
+
+# Deploys all three workers (API, dashboard, storefront) plus D1/R2/KV.
+#
+# MINIMUM REQUIRED SECRET: CLOUDFLARE_API_TOKEN (Edit Workers + D1 + R2 + KV).
+# Everything else is optional:
+#   - CLOUDFLARE_ACCOUNT_ID is fetched from the token when omitted.
+#   - Without API_DOMAIN/DASHBOARD_DOMAIN/STORE_DOMAIN the workers are
+#     published on the account's free *.workers.dev subdomain.
+#   - BETTER_AUTH_SECRET / STORE_API_KEY / MCP_LOGIN_TICKET_SECRET are derived
+#     deterministically from the API token (HMAC-SHA256) when omitted, so
+#     re-runs stay consistent. Provide them explicitly for production.
+#   - ADMIN_EMAIL defaults to admin@example.com.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reset_db:
+        description: 'Delete + recreate D1 (fresh database, wipes data)'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: cloudflare-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-cloudflare:
+    name: Deploy to Cloudflare Workers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prepare deployment values
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
+          STORE_API_KEY: ${{ secrets.STORE_API_KEY }}
+          MCP_LOGIN_TICKET_SECRET: ${{ secrets.MCP_LOGIN_TICKET_SECRET }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_NAME: ${{ secrets.ADMIN_NAME }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::The CLOUDFLARE_API_TOKEN repository secret is required (Workers + D1 + R2 + KV edit permissions)."
+            exit 1
+          fi
+          # Stable child secrets derived from the token (HMAC-SHA256) so that
+          # re-runs keep the same values unless the token is rotated.
+          derive() { printf '%s' "$2" | openssl dgst -sha256 -hmac "$CLOUDFLARE_API_TOKEN" -hex | awk '{print $NF}'; }
+          {
+            echo "BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET:-$(derive codflow/better-auth:v1)}"
+            echo "STORE_API_KEY=${STORE_API_KEY:-$(derive codflow/store-api-key:v1)}"
+            echo "MCP_LOGIN_TICKET_SECRET=${MCP_LOGIN_TICKET_SECRET:-$(derive codflow/mcp-ticket:v1)}"
+            echo "ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}"
+            echo "ADMIN_NAME=${ADMIN_NAME:-Admin}"
+            echo "ADMIN_PASSWORD=${ADMIN_PASSWORD:-$(derive codflow/admin-password:v1)}"
+          } >> "$GITHUB_ENV"
+
+      - name: Reset D1 database (manual trigger only)
+        if: ${{ inputs.reset_db == true }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx wrangler d1 delete codflow-db --skip-confirmation || true
+
+      - name: Generate Cloudflare config
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          API_DOMAIN: ${{ secrets.API_DOMAIN }}
+          DASHBOARD_DOMAIN: ${{ secrets.DASHBOARD_DOMAIN }}
+          STORE_DOMAIN: ${{ secrets.STORE_DOMAIN }}
+          BETTER_AUTH_SECRET: ${{ env.BETTER_AUTH_SECRET }}
+          STORE_API_KEY: ${{ env.STORE_API_KEY }}
+          MCP_LOGIN_TICKET_SECRET: ${{ env.MCP_LOGIN_TICKET_SECRET }}
+          ADMIN_EMAIL: ${{ env.ADMIN_EMAIL }}
+          # Optional
+          MEDIA_DOMAIN: ${{ secrets.MEDIA_DOMAIN }}
+          ADMIN_NAME: ${{ env.ADMIN_NAME }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          RATE_LIMIT_KV_ID: ${{ secrets.RATE_LIMIT_KV_ID }}
+          OAUTH_KV_ID: ${{ secrets.OAUTH_KV_ID }}
+          # The theme worker deploys under this name (cod-astro/theme01/wrangler.jsonc).
+          STORE_WORKER_NAME: codflow-os-theme01
+          COD_DB_NAME: ${{ vars.COD_DB_NAME }}
+          COD_R2_BUCKET_NAME: ${{ vars.COD_R2_BUCKET_NAME }}
+        run: node scripts/configure-cloudflare.mjs
+
+      - name: Authenticate with Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler whoami
+
+      - name: Apply remote migrations and seed data
+        id: migrate
+        working-directory: cod-server
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          STORE_API_KEY: ${{ env.STORE_API_KEY }}
+          # Needed when the configure script is re-run during dirty-state recovery.
+          STORE_WORKER_NAME: codflow-os-theme01
+          ADMIN_EMAIL: ${{ env.ADMIN_EMAIL }}
+          ADMIN_NAME: ${{ env.ADMIN_NAME }}
+          BETTER_AUTH_SECRET: ${{ env.BETTER_AUTH_SECRET }}
+          MCP_LOGIN_TICKET_SECRET: ${{ env.MCP_LOGIN_TICKET_SECRET }}
+        run: |
+          set -o pipefail
+          rm -f /tmp/migrate-all.log
+          ok=0
+          for attempt in 1 2 3; do
+            echo "::group::db:migrate:remote (attempt $attempt)"
+            { echo "===== ATTEMPT $attempt ====="; } >> /tmp/migrate-all.log
+            if npm run db:migrate:remote 2>&1 | tee -a /tmp/migrate-all.log; then
+              echo "::endgroup::"
+              ok=1
+              break
+            fi
+            echo "::endgroup::"
+            # Self-heal: a partially-committed migration batch (D1 executes
+            # multi-statement files non-atomically) leaves tables behind with
+            # an empty d1_migrations journal. Recreating the database is the
+            # only clean recovery — do it once, automatically.
+            if [ "$attempt" = "1" ] && grep -aq "already exists" /tmp/migrate-all.log; then
+              echo "::warning::Dirty D1 state detected (tables without journal) — recreating database"
+              npx wrangler d1 delete codflow-db --skip-confirmation || true
+              ( cd .. && node scripts/configure-cloudflare.mjs ) || { echo "::error::re-configure after D1 reset failed"; exit 1; }
+              sleep 5
+              continue
+            fi
+            echo "Migrations attempt $attempt failed."
+            sleep 5
+          done
+          [ "$ok" = "1" ] || { cp /tmp/migrate-all.log /tmp/migrate.log; exit 1; }
+          npm run db:seed:remote 2>&1 | tee /tmp/seed.log || { tail -c 4000 /tmp/seed.log > /tmp/step-error.log; exit 1; }
+
+      - name: Seed merchant admin account
+        id: seedadmin
+        working-directory: cod-client-astro
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ADMIN_EMAIL: ${{ env.ADMIN_EMAIL }}
+          ADMIN_NAME: ${{ env.ADMIN_NAME }}
+          ADMIN_PASSWORD: ${{ env.ADMIN_PASSWORD }}
+        run: |
+          set +e
+          npm run seed:admin:remote -- "$ADMIN_PASSWORD" > /tmp/seed-admin.log 2>&1
+          SEED_EXIT=$?
+          cp /tmp/seed-admin.log /tmp/step-error.log
+          printf '::notice::[seed-admin] exit=%s tail=%s\n' "$SEED_EXIT" "$(tail -c 260 /tmp/seed-admin.log | tr '\n' ' ' | tr -d '%')"
+          grep -aE "Email|Password|API Key" /tmp/seed-admin.log > /tmp/admin-creds.txt || true
+          [ "$SEED_EXIT" = "0" ] || exit 1
+
+      - name: Which step failed
+        if: failure()
+        run: |
+          echo "::notice::[diag] migrate=${{ steps.migrate.outcome }} seedadmin=${{ steps.seedadmin.outcome }} secrets_server=${{ steps.secrets_server.outcome }} deploy_server=${{ steps.deploy_server.outcome }} secrets_dash=${{ steps.secrets_dash.outcome }} deploy_dash=${{ steps.deploy_dash.outcome }} secrets_store=${{ steps.secrets_store.outcome }} deploy_store=${{ steps.deploy_store.outcome }} enable_wd=${{ steps.enable_wd.outcome }} smoke=${{ steps.smoke.outcome }} publish=${{ steps.publish_info.outcome }}"
+
+      - name: Report failure
+        if: failure()
+        working-directory: cod-server
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.CF_ACCOUNT_ID }}
+        run: |
+          DIAG=$(npx wrangler d1 execute codflow-db --remote --command \
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name" --json 2>&1 | tail -c 1000 || true)
+          DIAG2=$(npx wrangler d1 execute codflow-db --remote --command \
+            "SELECT * FROM d1_migrations" --json 2>&1 | tail -c 800 || true)
+          {
+            echo "### ❌ Deploy failed — run $GITHUB_RUN_ID"
+            echo ""
+            echo "**sqlite_master tables**"
+            echo '```'
+            echo "$DIAG"
+            echo '```'
+            echo "**d1_migrations**"
+            echo '```'
+            echo "$DIAG2"
+            echo '```'
+            for f in /tmp/migrate.log /tmp/seed.log /tmp/seed-admin.log; do
+              if [ -f "$f" ]; then
+                echo ""
+                echo "**tail of \`$f\`**"
+                echo '```'
+                tail -n 40 "$f"
+                echo '```'
+              fi
+            done
+          } > /tmp/failure-body.md
+          COMMENT_RESULT=$(gh api "repos/${{ github.repository }}/issues/1/comments" -F body=@/tmp/failure-body.md 2>&1 | tail -c 200) \
+            && echo "failure comment posted to issue 1" \
+            || echo "::error::comment post failed: $COMMENT_RESULT"
+          # Annotation channel (readable even when run-log download fails).
+          {
+            echo "TABLES: $DIAG"
+            echo "MIGR: $DIAG2"
+            echo "ERRORS:"
+            grep -ahE "✘|ERROR|Error:|already exists|failed|ELIFECYCLE" /tmp/migrate.log /tmp/seed-admin.log 2>/dev/null | head -8
+          } > /tmp/fail-ann.txt
+          tail -c 1800 /tmp/fail-ann.txt | tr '\r\n' '  ' | fold -w 210 | head -8 | while IFS= read -r chunk; do
+            chunk=${chunk//%/%25}
+            echo "::error::[tail] $chunk"
+          done
+          exit 1
+
+      - name: Set server secrets
+        id: secrets_server
+        working-directory: cod-server
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          BETTER_AUTH_SECRET: ${{ env.BETTER_AUTH_SECRET }}
+          STORE_API_KEY: ${{ env.STORE_API_KEY }}
+          MCP_LOGIN_TICKET_SECRET: ${{ env.MCP_LOGIN_TICKET_SECRET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.CF_ACCOUNT_ID }}
+        run: |
+          printf '%s' "$BETTER_AUTH_SECRET" | npx wrangler secret put BETTER_AUTH_SECRET
+          printf '%s' "$STORE_API_KEY" | npx wrangler secret put STORE_API_KEY
+          printf '%s' "$MCP_LOGIN_TICKET_SECRET" | npx wrangler secret put MCP_LOGIN_TICKET_SECRET
+          if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ]; then
+            printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | npx wrangler secret put CF_ACCOUNT_ID
+            printf '%s' "$R2_ACCESS_KEY_ID" | npx wrangler secret put R2_ACCESS_KEY_ID
+            printf '%s' "$R2_SECRET_ACCESS_KEY" | npx wrangler secret put R2_SECRET_ACCESS_KEY
+          fi
+
+      - name: Deploy cod-server
+        id: deploy_server
+        working-directory: cod-server
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          API_DOMAIN: ${{ secrets.API_DOMAIN }}
+        run: |
+          if [ -n "$API_DOMAIN" ]; then
+            npx wrangler deploy --route "$API_DOMAIN"
+          else
+            npx wrangler deploy
+          fi
+
+      - name: Set dashboard secrets
+        id: secrets_dash
+        working-directory: cod-client-astro
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          BETTER_AUTH_SECRET: ${{ env.BETTER_AUTH_SECRET }}
+          MCP_LOGIN_TICKET_SECRET: ${{ env.MCP_LOGIN_TICKET_SECRET }}
+        run: |
+          printf '%s' "$BETTER_AUTH_SECRET" | npx wrangler secret put BETTER_AUTH_SECRET
+          printf '%s' "$MCP_LOGIN_TICKET_SECRET" | npx wrangler secret put MCP_LOGIN_TICKET_SECRET
+
+      - name: Deploy cod-client-astro (dashboard)
+        id: deploy_dash
+        working-directory: cod-client-astro
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DASHBOARD_DOMAIN: ${{ secrets.DASHBOARD_DOMAIN }}
+        run: |
+          npm run build
+          if [ -n "$DASHBOARD_DOMAIN" ]; then
+            npx wrangler deploy --route "$DASHBOARD_DOMAIN"
+          else
+            npx wrangler deploy
+          fi
+
+      - name: Set storefront secrets
+        id: secrets_store
+        working-directory: cod-astro/theme01
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          STORE_API_KEY: ${{ env.STORE_API_KEY }}
+          MEDIA_DOMAIN: ${{ secrets.MEDIA_DOMAIN }}
+        run: |
+          printf '%s' "$STORE_API_KEY" | npx wrangler secret put STORE_API_KEY
+          if [ -n "$MEDIA_DOMAIN" ]; then
+            printf '%s' "$MEDIA_DOMAIN" | npx wrangler secret put MEDIA_DOMAIN
+          fi
+
+      - name: Deploy storefront
+        id: deploy_store
+        working-directory: cod-astro/theme01
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          STORE_DOMAIN: ${{ secrets.STORE_DOMAIN }}
+          COD_SERVER_URL: ${{ env.API_ORIGIN }}
+        run: |
+          npm run build
+          if [ -n "$STORE_DOMAIN" ]; then
+            npx wrangler deploy --var "COD_SERVER_URL:$COD_SERVER_URL" --route "$STORE_DOMAIN"
+          else
+            npx wrangler deploy --var "COD_SERVER_URL:$COD_SERVER_URL"
+          fi
+
+      # Only needed in workers.dev mode (wrangler routes mode already binds
+      # custom domains). Fresh accounts may have the per-worker workers.dev
+      # toggle off until the first UI visit.
+      - name: Enable workers.dev routes
+        id: enable_wd
+        if: env.DEPLOY_MODE == 'workersdev'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          for worker in codflow-server codflow-dashboard codflow-os-theme01; do
+            echo "Enabling workers.dev for ${worker}..."
+            curl -sS -X PATCH \
+              "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$worker/subdomain" \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data '{"enabled":true}' | head -c 300
+            echo ""
+          done
+
+      - name: Smoke test
+        id: smoke
+        continue-on-error: true
+        env:
+          STORE_API_KEY: ${{ env.STORE_API_KEY }}
+        run: |
+          sleep 20
+          : > /tmp/smoke.txt
+          check() {
+            local label="$1" url="$2"; shift 2
+            local code
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 30 "$@")
+            echo "- $label → HTTP $code" | tee -a /tmp/smoke.txt
+          }
+          echo "### Smoke results" >> /tmp/smoke.txt
+          check "API /health"        "$API_ORIGIN/health"        "$API_ORIGIN/health"
+          check "Store /store/config" "$API_ORIGIN/store/config" -H "X-Store-API-Key: $STORE_API_KEY" "$API_ORIGIN/store/config"
+          check "Dashboard"          "$DASHBOARD_ORIGIN"          "$DASHBOARD_ORIGIN/"
+          check "Storefront"         "$STORE_ORIGIN"              "$STORE_ORIGIN/"
+          cat /tmp/smoke.txt >> "$GITHUB_STEP_SUMMARY"
+
+      # Annotations are the only run output readable from the agent sandbox —
+      # publish the URLs + admin credentials + smoke results there too.
+      - name: Publish deployment info
+        id: publish_info
+        if: always()
+        working-directory: cod-server
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.CF_ACCOUNT_ID }}
+        run: |
+          COUNTS=$(npx wrangler d1 execute codflow-db --remote --command "SELECT (SELECT COUNT(*) FROM products) AS products, (SELECT COUNT(*) FROM products WHERE status='ACTIVE' AND show_in_store=1 AND visibility=1 AND deleted_at IS NULL) AS visible_products, (SELECT COUNT(*) FROM stores) AS stores, (SELECT COUNT(*) FROM store_api_keys) AS store_keys, (SELECT COUNT(*) FROM users) AS users" --json 2>&1 | tr -d '\n' | grep -oE '"results": *\[.*\]' | head -c 400)
+          COUNTS=${COUNTS:-"(query failed)"}
+          {
+            echo "COUNTS: $COUNTS"
+            echo "URLS: MODE=$DEPLOY_MODE API=$API_ORIGIN DASH=$DASHBOARD_ORIGIN STORE=$STORE_ORIGIN"
+            echo "ADMIN: email=$ADMIN_EMAIL password_length=${#ADMIN_PASSWORD} (stable derived secret)"
+            echo "SMOKE: $(tr '\n' '|' < /tmp/smoke.txt 2>/dev/null)"
+          } > /tmp/deploy-info.txt
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            line=${line//%/%25}
+            echo "::notice::[deploy-info] $line"
+          done < /tmp/deploy-info.txt
+
+      - name: Summary
+        run: |
+          {
+            echo "## Deploy finished ($DEPLOY_MODE mode)"
+            echo ""
+            echo "- API:        $API_ORIGIN"
+            echo "- Dashboard:  $DASHBOARD_ORIGIN"
+            echo "- Storefront: $STORE_ORIGIN"
+            echo "- Admin login: $ADMIN_EMAIL"
+            echo ""
+            echo "Admin password was printed once in the **Seed merchant admin account** step logs."
+            if [ "$DEPLOY_MODE" = "workersdev" ]; then
+              echo ""
+              echo "> workers.dev mode: first DNS resolution may take ~1 minute."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
