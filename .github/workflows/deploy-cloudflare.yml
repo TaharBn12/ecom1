@@ -139,10 +139,18 @@ jobs:
             # multi-statement files non-atomically) leaves tables behind with
             # an empty d1_migrations journal. Recreating the database is the
             # only clean recovery — do it once, automatically.
-            if [ "$attempt" = "1" ] && grep -aq "already exists" /tmp/migrate-all.log; then
-              echo "::warning::Dirty D1 state detected (tables without journal) — recreating database"
-              npx wrangler d1 delete codflow-db --skip-confirmation || true
-              ( cd .. && node scripts/configure-cloudflare.mjs ) || { echo "::error::re-configure after D1 reset failed"; exit 1; }
+            # Also handle fresh DB with no d1_migrations table (SQLITE_ERROR 7500)
+            if [ "$attempt" = "1" ] && grep -aqE "already exists|no such table: d1_migrations" /tmp/migrate-all.log; then
+              if grep -aq "no such table: d1_migrations" /tmp/migrate-all.log; then
+                echo "::warning::Fresh D1 detected (no d1_migrations table) — creating table manually"
+                npx wrangler d1 execute codflow-db --remote --command "CREATE TABLE IF NOT EXISTS d1_migrations (id TEXT PRIMARY KEY, name TEXT, applied_at TEXT DEFAULT CURRENT_TIMESTAMP);" || true
+                # Try to execute 0000_complete.sql directly if needed
+                npx wrangler d1 execute codflow-db --remote --file=src/db/migrations/0000_complete.sql 2>&1 | tail -n 20 || true
+              else
+                echo "::warning::Dirty D1 state detected (tables without journal) — recreating database"
+                npx wrangler d1 delete codflow-db --skip-confirmation || true
+                ( cd .. && node scripts/configure-cloudflare.mjs ) || { echo "::error::re-configure after D1 reset failed"; exit 1; }
+              fi
               sleep 5
               continue
             fi
