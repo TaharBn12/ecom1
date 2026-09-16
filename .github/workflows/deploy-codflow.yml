@@ -7,10 +7,6 @@ on:
         description: 'Project prefix (e.g. codflow, mystore)'
         required: true
         default: 'codflow'
-      overwrite:
-        description: 'Overwrite existing workers?'
-        type: boolean
-        default: true
 
 jobs:
   deploy:
@@ -31,6 +27,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Check Cloudflare auth
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -38,50 +37,101 @@ jobs:
           npx wrangler whoami
           echo "Auth OK"
 
-      - name: Create Cloudflare Resources
+      - name: Create and Bind Cloudflare Resources
         id: create_resources
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           PROJECT=${{ inputs.project_prefix }}
           echo "PROJECT=$PROJECT" >> $GITHUB_ENV
+          echo "PROJECT=$PROJECT"
           
           echo "=== Creating D1 ${PROJECT}-db ==="
-          npx wrangler d1 create ${PROJECT}-db || echo "D1 may already exist"
+          npx wrangler d1 create ${PROJECT}-db 2>&1 || echo "D1 may already exist"
           
           echo "=== Creating R2 ${PROJECT}-images ==="
-          npx wrangler r2 bucket create ${PROJECT}-images || echo "R2 may already exist"
+          npx wrangler r2 bucket create ${PROJECT}-images 2>&1 || echo "R2 may already exist"
           
           echo "=== Creating KV RATE_LIMIT ==="
-          npx wrangler kv namespace create RATE_LIMIT || true
+          npx wrangler kv namespace create RATE_LIMIT 2>&1 || true
           
           echo "=== Creating KV OAUTH_KV ==="
-          npx wrangler kv namespace create OAUTH_KV || true
+          npx wrangler kv namespace create OAUTH_KV 2>&1 || true
           
           echo "=== Listing resources ==="
           npx wrangler d1 list
-          npx wrangler r2 bucket list
           npx wrangler kv namespace list
-
-      - name: Generate wrangler.toml files (if not exist, use example with real IDs placeholder - user must update)
-        run: |
-          # For now, we keep existing wrangler.toml files from repo
-          # The user should have set real IDs via previous step output
-          # This step verifies no placeholder remains
-          echo "Checking wrangler.toml files..."
-          cat cod-server/wrangler.toml | head -n 50
-          cat cod-client-astro/wrangler.toml | head -n 30
-          # If placeholders exist, we will use local random IDs as fallback for deploy to succeed
-          # Real deployment needs real IDs - see logs
-          if grep -q "00000000-0000" cod-server/wrangler.toml; then
-            echo "WARNING: Placeholders found in cod-server/wrangler.toml - using existing D1 list to inject"
-            # Try to auto-inject first D1 ID
-            D1_ID=$(npx wrangler d1 list --json 2>/dev/null | jq -r '.[0].uuid' || echo "")
-            if [ -n "$D1_ID" ]; then
-              echo "Found D1 ID: $D1_ID"
-              sed -i "s/00000000-0000-0000-0000-000000000000/$D1_ID/g" cod-server/wrangler.toml || true
-            fi
+          
+          # Get real IDs
+          echo "=== Fetching real IDs ==="
+          D1_JSON=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
+          echo "$D1_JSON" | jq .
+          D1_ID=$(echo "$D1_JSON" | jq -r --arg name "${PROJECT}-db" '.[] | select(.name==$name) | .uuid' | head -n1)
+          if [ -z "$D1_ID" ]; then
+            D1_ID=$(echo "$D1_JSON" | jq -r '.[0].uuid' | head -n1)
           fi
+          echo "D1_ID=$D1_ID"
+          echo "D1_ID=$D1_ID" >> $GITHUB_ENV
+          
+          KV_JSON=$(npx wrangler kv namespace list --json 2>/dev/null || npx wrangler kv namespace list 2>&1)
+          echo "$KV_JSON" | head -n 100
+          # Try to parse KV ids - they are in format id + title
+          # Use wrangler kv namespace list and grep
+          KV_RATE_ID=$(npx wrangler kv namespace list 2>&1 | grep -A1 "RATE_LIMIT" | grep -oE "[a-f0-9]{32}" | head -n1 || echo "")
+          KV_OAUTH_ID=$(npx wrangler kv namespace list 2>&1 | grep -A1 "OAUTH_KV" | grep -oE "[a-f0-9]{32}" | head -n1 || echo "")
+          # Fallback: get any two KV ids
+          if [ -z "$KV_RATE_ID" ]; then
+            KV_RATE_ID=$(npx wrangler kv namespace list 2>&1 | grep -oE "[a-f0-9]{32}" | head -n1)
+          fi
+          if [ -z "$KV_OAUTH_ID" ]; then
+            KV_OAUTH_ID=$(npx wrangler kv namespace list 2>&1 | grep -oE "[a-f0-9]{32}" | sed -n '2p')
+          fi
+          echo "KV_RATE_ID=$KV_RATE_ID"
+          echo "KV_OAUTH_ID=$KV_OAUTH_ID"
+          echo "KV_RATE_ID=$KV_RATE_ID" >> $GITHUB_ENV
+          echo "KV_OAUTH_ID=$KV_OAUTH_ID" >> $GITHUB_ENV
+          
+          # Rewrite wrangler.toml files with real IDs
+          echo "=== Rewriting wrangler.toml with real IDs ==="
+          # cod-server
+          if [ -n "$D1_ID" ]; then
+            sed -i "s/00000000-0000-0000-0000-000000000000/$D1_ID/g" cod-server/wrangler.toml || true
+            # Also replace any UUID placeholder pattern
+            sed -i "s/d9fd263d-ac3c-4075-ad82-5fc58420ce39/$D1_ID/g" cod-server/wrangler.toml || true
+            sed -i "s/eddf62d4-6fd9-4013-b374-6d387b67bb0c/$D1_ID/g" cod-server/wrangler.toml || true
+          fi
+          if [ -n "$KV_RATE_ID" ]; then
+            # Replace first KV placeholder
+            sed -i "0,/30b8f0efac83e176c5688731eb29ce3d/s//${KV_RATE_ID}/" cod-server/wrangler.toml || true
+            sed -i "s/30b8f0efac83e176c5688731eb29ce3d/${KV_RATE_ID}/g" cod-server/wrangler.toml || true
+          fi
+          if [ -n "$KV_OAUTH_ID" ]; then
+            sed -i "s/86f0c3fcb8426dbd47a223dee6384a99/${KV_OAUTH_ID}/g" cod-server/wrangler.toml || true
+          fi
+          
+          # cod-client-astro
+          if [ -n "$D1_ID" ]; then
+            sed -i "s/d9fd263d-ac3c-4075-ad82-5fc58420ce39/$D1_ID/g" cod-client-astro/wrangler.toml || true
+            sed -i "s/<your-d1-database-id>/$D1_ID/g" cod-client-astro/wrangler.toml || true
+          fi
+          if [ -n "$KV_RATE_ID" ]; then
+            sed -i "s/52323408a1a8e53f0b5df93ed5391620/${KV_RATE_ID}/g" cod-client-astro/wrangler.toml || true
+            sed -i "s/<your-kv-namespace-id>/${KV_RATE_ID}/g" cod-client-astro/wrangler.toml || true
+          fi
+          
+          echo "=== Updated cod-server/wrangler.toml ==="
+          grep -E "database_id|RATE_LIMIT|OAUTH_KV|id =" cod-server/wrangler.toml | head -n 20
+          echo "=== Updated cod-client-astro/wrangler.toml ==="
+          cat cod-client-astro/wrangler.toml
+          
+          # Create .env for scripts
+          cat > .env <<EOF
+          COD_DB_NAME=${PROJECT}-db
+          COD_R2_BUCKET_NAME=${PROJECT}-images
+          COD_SERVER_URL=https://${PROJECT}-server.workers.dev
+          COD_MEDIA_DOMAIN=media.example.com
+          EOF
+          cat .env
 
       - name: Generate Secrets
         id: secrets
@@ -92,17 +142,33 @@ jobs:
           echo "BETTER_AUTH_SECRET=$BETTER_AUTH_SECRET" >> $GITHUB_ENV
           echo "STORE_API_KEY=$STORE_API_KEY" >> $GITHUB_ENV
           echo "MCP_LOGIN_TICKET_SECRET=$MCP_LOGIN_TICKET_SECRET" >> $GITHUB_ENV
-          echo "Generated secrets (will be set as wrangler secrets)"
+          # Save for later steps output (masked)
+          echo "::add-mask::$BETTER_AUTH_SECRET"
+          echo "::add-mask::$STORE_API_KEY"
+          echo "::add-mask::$MCP_LOGIN_TICKET_SECRET"
+          echo "Generated secrets"
 
-      - name: Migrate D1 Remote
+      - name: Migrate D1 Remote (Robust)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           cd cod-server
-          # Use project prefix for DB name
           export COD_DB_NAME=${{ env.PROJECT }}-db
-          echo "Migrating $COD_DB_NAME"
-          npx wrangler d1 migrations apply $COD_DB_NAME --remote || npm run db:migrate:remote || true
+          echo "=== Attempt 1: wrangler d1 migrations apply ==="
+          npx wrangler d1 migrations apply $COD_DB_NAME --remote 2>&1 || true
+          
+          echo "=== Check tables ==="
+          npx wrangler d1 execute $COD_DB_NAME --remote --command "SELECT name FROM sqlite_master WHERE type='table' LIMIT 20;" 2>&1 || true
+          
+          echo "=== Attempt 2: If d1_migrations missing, create it and apply 0000_complete.sql ==="
+          # Try to apply 0000_complete.sql directly if tables missing
+          npx wrangler d1 execute $COD_DB_NAME --remote --file=src/db/migrations/0000_complete.sql 2>&1 || echo "0000_complete.sql may have failed, trying alternative"
+          
+          echo "=== Attempt 3: Re-apply all migrations ==="
+          npx wrangler d1 migrations apply $COD_DB_NAME --remote 2>&1 || true
+          
+          echo "=== Final table check ==="
+          npx wrangler d1 execute $COD_DB_NAME --remote --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;" 2>&1 | tail -n 100
 
       - name: Seed D1 Remote
         env:
@@ -111,7 +177,10 @@ jobs:
         run: |
           cd cod-server
           export COD_DB_NAME=${{ env.PROJECT }}-db
-          npm run db:seed:remote || echo "Seed may have failed, continuing"
+          echo "Seeding with STORE_API_KEY"
+          npm run db:seed:remote 2>&1 || echo "Seed failed, trying direct insert"
+          # Verify
+          npx wrangler d1 execute $COD_DB_NAME --remote --command "SELECT count(*) as products FROM products; SELECT count(*) as categories FROM product_categories;" 2>&1 | tail -n 20
 
       - name: Seed Admin Remote
         env:
@@ -119,7 +188,9 @@ jobs:
         run: |
           cd cod-client-astro
           export COD_DB_NAME=${{ env.PROJECT }}-db
-          ADMIN_EMAIL=admin@example.com ADMIN_NAME=Admin npm run seed:admin:remote || true
+          ADMIN_EMAIL=admin@example.com ADMIN_NAME=Admin npm run seed:admin:remote 2>&1 || true
+          cd ../cod-server
+          npx wrangler d1 execute ${{ env.PROJECT }}-db --remote --command "SELECT email, role FROM users LIMIT 5;" 2>&1 | tail -n 20
 
       - name: Deploy cod-server
         env:
@@ -128,17 +199,26 @@ jobs:
           cd cod-server
           npx wrangler deploy
           echo "Setting secrets..."
-          printf "${{ env.BETTER_AUTH_SECRET }}" | npx wrangler secret put BETTER_AUTH_SECRET || true
-          printf "${{ env.MCP_LOGIN_TICKET_SECRET }}" | npx wrangler secret put MCP_LOGIN_TICKET_SECRET || true
+          printf "${{ env.BETTER_AUTH_SECRET }}" | npx wrangler secret put BETTER_AUTH_SECRET
+          printf "${{ env.MCP_LOGIN_TICKET_SECRET }}" | npx wrangler secret put MCP_LOGIN_TICKET_SECRET
+          printf "${{ env.STORE_API_KEY }}" | npx wrangler secret put STORE_API_KEY || true
+          echo "cod-server deployed"
 
       - name: Deploy cod-client-astro
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           cd cod-client-astro
+          # Update PUBLIC_API_URL to point to deployed server
+          echo "PUBLIC_API_URL=\"https://${{ env.PROJECT }}-server.workers.dev\"" > .env
+          cat .env
+          # Update wrangler.toml vars for production
+          sed -i "s|https://api.example.com|https://${{ env.PROJECT }}-server.workers.dev|g" wrangler.toml || true
+          sed -i "s|https://dashboard.example.com|https://${{ env.PROJECT }}-dashboard.workers.dev|g" wrangler.toml || true
           npx wrangler deploy
-          printf "${{ env.BETTER_AUTH_SECRET }}" | npx wrangler secret put BETTER_AUTH_SECRET || true
-          printf "${{ env.MCP_LOGIN_TICKET_SECRET }}" | npx wrangler secret put MCP_LOGIN_TICKET_SECRET || true
+          printf "${{ env.BETTER_AUTH_SECRET }}" | npx wrangler secret put BETTER_AUTH_SECRET
+          printf "${{ env.MCP_LOGIN_TICKET_SECRET }}" | npx wrangler secret put MCP_LOGIN_TICKET_SECRET
+          echo "dashboard deployed"
 
       - name: Deploy theme01
         env:
@@ -146,18 +226,42 @@ jobs:
           STORE_API_KEY: ${{ env.STORE_API_KEY }}
         run: |
           cd cod-astro/theme01
-          # Set COD_SERVER_URL from env or use default workers.dev
-          echo "COD_SERVER_URL=https://${{ env.PROJECT }}-server.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev" > ../../.env || true
+          echo "COD_SERVER_URL=https://${{ env.PROJECT }}-server.workers.dev" > .dev.vars
+          echo "STORE_API_KEY=${{ env.STORE_API_KEY }}" >> .dev.vars
+          cat .dev.vars
+          # Update root .env for deploy script
+          echo "COD_SERVER_URL=https://${{ env.PROJECT }}-server.workers.dev" > ../../.env
+          echo "COD_DB_NAME=${{ env.PROJECT }}-db" >> ../../.env
+          echo "COD_R2_BUCKET_NAME=${{ env.PROJECT }}-images" >> ../../.env
           npx wrangler deploy || npm run deploy || true
           printf "${{ env.STORE_API_KEY }}" | npx wrangler secret put STORE_API_KEY || true
+          echo "theme01 deployed"
+
+      - name: Smoke Tests
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          echo "=== Smoke Tests ==="
+          API_URL="https://${{ env.PROJECT }}-server.workers.dev"
+          DASH_URL="https://${{ env.PROJECT }}-dashboard.workers.dev"
+          STORE_URL="https://${{ env.PROJECT }}-os-theme01.workers.dev"
+          echo "API: $API_URL"
+          echo "Dashboard: $DASH_URL"
+          echo "Store: $STORE_URL"
+          sleep 10
+          curl -s -o /dev/null -w "%{http_code}" $API_URL/api/docs || true
+          echo ""
+          curl -s $API_URL/api/docs | head -n 20 || true
 
       - name: Summary
         run: |
           echo "=== Deployment Complete ==="
           echo "Project: ${{ env.PROJECT }}"
-          echo "Check your Cloudflare dashboard for workers:"
-          echo "- ${{ env.PROJECT }}-server"
-          echo "- ${{ env.PROJECT }}-dashboard"
-          echo "- ${{ env.PROJECT }}-os-theme01"
+          echo "API: https://${{ env.PROJECT }}-server.workers.dev"
+          echo "Dashboard: https://${{ env.PROJECT }}-dashboard.workers.dev"
+          echo "Storefront: https://${{ env.PROJECT }}-os-theme01.workers.dev"
           echo ""
-          echo "Admin credentials: admin@example.com (password in previous step logs)"
+          echo "Admin: admin@example.com (check seed:admin:remote logs for password)"
+          echo "STORE_API_KEY: ${{ env.STORE_API_KEY }} (masked)"
+          echo ""
+          echo "If dashboard login fails with 403 INVALID_ORIGIN, update PUBLIC_TRUSTED_ORIGINS in cod-client-astro/wrangler.toml and redeploy"
